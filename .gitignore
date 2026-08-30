@@ -1,0 +1,5 @@
+my_agent/.env
+my_agent/.adk/
+my_agent/__pycache__
+venv
+
