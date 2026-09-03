@@ -2,4 +2,5 @@ FinancialAnalysisAgent/.env
 FinancialAnalysisAgent/.adk/
 FinancialAnalysisAgent/__pycache__
 venv
+.env
 
