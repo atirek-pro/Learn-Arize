@@ -46,73 +46,292 @@ Replace the generated `agent.py` with the full agent code below.
 
 ```python
 """
-We're building a financial analysis chatbot using the Google ADK SDK.
+Financial Analysis Agent
 
-The agent works in two turns:
+Experiment:
+    Google ADK + OpenInference + explicit Python tool
 
-Turn 1: Research — searches the web for real financial data
-Turn 2: Write — compiles the research into a readable report
+Unlike the previous version, this agent does NOT use Google's
+built-in google_search tool.
 
-The Agent maintains conversation context between turns, so the writer
-has access to the researcher's findings.
+Instead, the LLM explicitly calls a normal Python function:
+    yahoo_finance_research()
+
+This allows us to determine whether normal ADK tool execution
+produces clean TOOL spans in Arize/OpenInference.
 """
-import os
-from dotenv import load_dotenv
-from arize.otel import register
 
+import os
+from datetime import datetime
+
+import yfinance as yf
+from dotenv import load_dotenv
+
+from arize.otel import register
 from google.adk.agents import Agent
-from google.adk.tools import google_search
 from openinference.instrumentation.google_adk import GoogleADKInstrumentor
 
+
+# ============================================================
+# ENVIRONMENT
+# ============================================================
+
 load_dotenv()
+
+
+# ============================================================
+# ARIZE / OPENINFERENCE
+# ============================================================
 
 trace_provider = register(
     space_id=os.getenv("ARIZE_AX_SPACE_ID"),
     api_key=os.getenv("ARIZE_AX_API_KEY"),
-    project_name="google_adk"
+    project_name="FinancialAnalysisAgent",
 )
 
-# Instrument Google ADK
 GoogleADKInstrumentor().instrument(
     tracer_provider=trace_provider
 )
 
-RESEARCH_PROMPT = """Research {tickers}. Focus on: {focus}.
-Use web search to find current financial data, news, and trends."""
+
+# ============================================================
+# YAHOO FINANCE TOOL
+# ============================================================
+
+def yahoo_finance_research(
+    tickers: str,
+    focus: str,
+) -> dict:
+    """
+    Fetch financial data and recent news from Yahoo Finance.
+
+    Args:
+        tickers:
+            Comma-separated ticker symbols.
+            Example: "AAPL" or "AAPL,MSFT"
+
+        focus:
+            Specific financial analysis focus.
+            Example:
+            "revenue growth and services segment"
+
+    Returns:
+        Structured financial research data.
+    """
+
+    ticker_list = [
+        ticker.strip().upper()
+        for ticker in tickers.split(",")
+        if ticker.strip()
+    ]
+
+    if not ticker_list:
+        return {
+            "status": "error",
+            "message": "No valid ticker symbols provided.",
+        }
+
+    results = []
+
+    for symbol in ticker_list:
+
+        try:
+
+            ticker = yf.Ticker(symbol)
+
+            # ------------------------------------------------
+            # Basic company information
+            # ------------------------------------------------
+
+            info = ticker.info
+
+            company_name = info.get(
+                "longName",
+                info.get("shortName", symbol),
+            )
+
+            # ------------------------------------------------
+            # Current / recent market data
+            # ------------------------------------------------
+
+            history = ticker.history(
+                period="5d"
+            )
+
+            recent_prices = []
+
+            if not history.empty:
+
+                for index, row in history.iterrows():
+
+                    recent_prices.append({
+                        "date": index.strftime("%Y-%m-%d"),
+                        "open": (
+                            float(row["Open"])
+                            if row["Open"] is not None
+                            else None
+                        ),
+                        "high": (
+                            float(row["High"])
+                            if row["High"] is not None
+                            else None
+                        ),
+                        "low": (
+                            float(row["Low"])
+                            if row["Low"] is not None
+                            else None
+                        ),
+                        "close": (
+                            float(row["Close"])
+                            if row["Close"] is not None
+                            else None
+                        ),
+                        "volume": (
+                            int(row["Volume"])
+                            if row["Volume"] is not None
+                            else None
+                        ),
+                    })
+
+            # ------------------------------------------------
+            # Recent Yahoo Finance news
+            # ------------------------------------------------
+
+            news_items = []
+
+            try:
+
+                news = ticker.news
+
+                for item in news[:10]:
+
+                    content = item.get(
+                        "content",
+                        {}
+                    )
+
+                    title = content.get(
+                        "title"
+                    )
+
+                    publisher = content.get(
+                        "provider", {}
+                    ).get(
+                        "displayName"
+                    )
+
+                    canonical_url = (
+                        content
+                        .get("canonicalUrl", {})
+                        .get("url")
+                    )
+
+                    news_items.append({
+                        "title": title,
+                        "publisher": publisher,
+                        "url": canonical_url,
+                    })
+
+            except Exception as news_error:
+
+                news_items.append({
+                    "error": str(news_error)
+                })
+
+            # ------------------------------------------------
+            # Financial metrics relevant to analysis
+            # ------------------------------------------------
+
+            financial_metrics = {
+                "market_cap": info.get("marketCap"),
+                "trailing_pe": info.get("trailingPE"),
+                "forward_pe": info.get("forwardPE"),
+                "profit_margins": info.get("profitMargins"),
+                "operating_margins": info.get("operatingMargins"),
+                "revenue_growth": info.get("revenueGrowth"),
+                "earnings_growth": info.get("earningsGrowth"),
+                "return_on_equity": info.get("returnOnEquity"),
+                "debt_to_equity": info.get("debtToEquity"),
+                "dividend_yield": info.get("dividendYield"),
+            }
+
+            results.append({
+                "ticker": symbol,
+                "company_name": company_name,
+                "focus": focus,
+                "financial_metrics": financial_metrics,
+                "recent_prices": recent_prices,
+                "recent_news": news_items,
+            })
+
+        except Exception as e:
+
+            results.append({
+                "ticker": symbol,
+                "focus": focus,
+                "status": "error",
+                "error": str(e),
+            })
+
+    return {
+        "status": "success",
+        "retrieved_at": datetime.utcnow().isoformat(),
+        "requested_tickers": ticker_list,
+        "focus": focus,
+        "results": results,
+    }
 
 
-WRITE_PROMPT = """Now write a concise financial report based on your research above."""
-
+# ============================================================
+# AGENT
+# ============================================================
 
 root_agent = Agent(
     name="financial_report_agent",
+
     model="gemini-flash-latest",
+
     description=(
-        "An agent that researches financial information using web search "
-        "and writes concise financial reports."
+        "A financial analysis agent that retrieves financial data "
+        "and recent financial news using an explicit Yahoo Finance "
+        "Python tool, then produces a concise financial report."
     ),
+
     instruction=(
         "You are a financial analysis agent.\n\n"
 
-        "When the user asks for a financial report, follow this workflow:\n\n"
+        "Your job is to produce a concise financial analysis report "
+        "based on current data retrieved from Yahoo Finance.\n\n"
 
-        "1. RESEARCH\n"
+        "Follow this workflow:\n\n"
+
+        "1. UNDERSTAND THE REQUEST\n"
         "   - Identify the requested ticker symbols.\n"
-        "   - Identify the user's requested focus.\n"
-        "   - Use web search to find current financial data, relevant news, "
-        "and market trends.\n"
-        "   - Base your analysis on current, reliable information.\n\n"
+        "   - Identify the user's requested analytical focus.\n\n"
 
-        "2. WRITE\n"
-        "   - Use the research gathered above.\n"
-        "   - Write a concise and readable financial report.\n"
-        "   - Clearly distinguish factual information from analysis or outlook.\n"
+        "2. RESEARCH\n"
+        "   - You MUST call the yahoo_finance_research tool.\n"
+        "   - Pass the requested ticker symbols to the tool.\n"
+        "   - Pass the user's requested focus to the tool.\n"
         "   - Do not invent financial data.\n\n"
 
-        "Maintain the research findings in the current conversation context "
-        "so they can be used when writing the final report."
+        "3. ANALYZE\n"
+        "   - Review the financial metrics returned by the tool.\n"
+        "   - Review recent price information.\n"
+        "   - Review the recent news returned by the tool.\n"
+        "   - Relate the available evidence to the requested focus.\n\n"
+
+        "4. WRITE\n"
+        "   - Produce a concise financial report.\n"
+        "   - Clearly distinguish factual information from analysis "
+        "or interpretation.\n"
+        "   - Mention important data limitations when applicable.\n"
+        "   - Do not fabricate missing information.\n"
     ),
-    tools=[google_search],
+
+    tools=[
+        yahoo_finance_research
+    ],
 )
 ```
 
@@ -127,14 +346,14 @@ The top of the file — `load_dotenv()`, `register(...)`, `GoogleADKInstrumentor
 What's new here:
 
 - **`google_search`** is passed into `tools=[google_search]`, giving the agent access to real web data instead of relying only on what the model already knows.
-- **`instruction`** encodes the *entire* two-step workflow (RESEARCH, then WRITE) as standing behavioral guidance for the agent — it applies throughout the conversation, not just once.
-- **`RESEARCH_PROMPT`** and **`WRITE_PROMPT`** are templates for what *you*, the user, send the agent — one per turn. They're not passed into the `Agent(...)` definition directly; they're the two messages that drive the two-turn conversation described next.
+- **`instruction`** encodes the _entire_ two-step workflow (RESEARCH, then WRITE) as standing behavioral guidance for the agent — it applies throughout the conversation, not just once.
+- **`RESEARCH_PROMPT`** and **`WRITE_PROMPT`** are templates for what _you_, the user, send the agent — one per turn. They're not passed into the `Agent(...)` definition directly; they're the two messages that drive the two-turn conversation described next.
 
 ---
 
 ## 5. The Two-Turn Pattern
 
-The agent's `instruction` defines *how* it should behave; `RESEARCH_PROMPT` and `WRITE_PROMPT` are the two actual messages you send it, one per turn:
+The agent's `instruction` defines _how_ it should behave; `RESEARCH_PROMPT` and `WRITE_PROMPT` are the two actual messages you send it, one per turn:
 
 ```python
 RESEARCH_PROMPT.format(tickers="AAPL, MSFT", focus="Q3 earnings and outlook")
@@ -149,13 +368,13 @@ WRITE_PROMPT
 
 **Turn 2** sends `WRITE_PROMPT` — a much shorter message. Notice it doesn't repeat any of the research. It doesn't need to: ADK keeps conversation context across turns, so the agent still has access to everything it found in Turn 1 when it writes the report in Turn 2.
 
-This is *why* it's a two-turn pattern rather than one long instruction: it splits "gather information" from "produce the final output" into separate steps you can inspect independently — which matters a lot once you look at the trace (Section 7).
+This is _why_ it's a two-turn pattern rather than one long instruction: it splits "gather information" from "produce the final output" into separate steps you can inspect independently — which matters a lot once you look at the trace (Section 7).
 
 ---
 
 ## 6. This Is Non-Deterministic by Design
 
-Run the same two prompts twice, and you likely won't get an identical report both times — the wording will differ, and even *what* gets emphasized in the report might shift slightly, since the model is generating language, not filling in a fixed template.
+Run the same two prompts twice, and you likely won't get an identical report both times — the wording will differ, and even _what_ gets emphasized in the report might shift slightly, since the model is generating language, not filling in a fixed template.
 
 This is expected, not a bug. What should stay consistent between runs is captured in the instruction's guardrails: sourcing claims from real search results, not inventing figures, and separating fact from analysis. Those constraints are exactly the kind of thing you'd check with an **eval** (Lecture 2) rather than expecting word-for-word repeatability — you're not testing for one exact output, you're testing whether the output stays within the boundaries the instruction sets.
 
@@ -165,7 +384,7 @@ This is expected, not a bug. What should stay consistent between runs is capture
 
 After running the agent through both turns, open your project in Arize AX. You'll see a trace with spans for each step: the model interpreting the research prompt, the `google_search` tool call(s), the reasoning over the results, and finally the write-up in Turn 2.
 
-This is **observability** in practice, not just in theory: instead of only seeing the final report, you can inspect *which* search results the agent actually used, whether its reasoning in Turn 1 is what fed into Turn 2 correctly, and where — if the final report is wrong or thin — the process broke down. This is the direct, hands-on version of the span-level visibility discussed in Lecture 2.
+This is **observability** in practice, not just in theory: instead of only seeing the final report, you can inspect _which_ search results the agent actually used, whether its reasoning in Turn 1 is what fed into Turn 2 correctly, and where — if the final report is wrong or thin — the process broke down. This is the direct, hands-on version of the span-level visibility discussed in Lecture 2.
 
 ---
 
